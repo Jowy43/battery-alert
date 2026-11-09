@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v5
+
+      - name: Instalar Rust estable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compilar
+        run: cargo build --release --locked
+
+      - name: Crear ZIP y suma SHA-256
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $package = Join-Path $PWD "dist/package"
+          New-Item -ItemType Directory -Force $package | Out-Null
+          Copy-Item target/release/battery-alert.exe, README.md -Destination $package
+          Compress-Archive -Path "$package/*" -DestinationPath dist/battery-alert-windows-x64.zip -CompressionLevel Optimal
+          $hash = (Get-FileHash dist/battery-alert-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  battery-alert-windows-x64.zip" | Set-Content -Encoding ascii dist/battery-alert-windows-x64.zip.sha256
+
+      - name: Publicar release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Battery Alert ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/battery-alert-windows-x64.zip
+            dist/battery-alert-windows-x64.zip.sha256

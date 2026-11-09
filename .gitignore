@@ -1,0 +1,23 @@
+# Compilación y paquetes de distribución
+/target/
+/dist/
+/out/
+*.exe
+*.pdb
+*.dmp
+*.zip
+
+# Archivos temporales y de ejecución
+*.rs.bk
+*.tmp
+*.log
+
+# Configuración local y secretos
+.env
+.env.*
+!.env.example
+
+# Archivos locales de Windows y editores
+Thumbs.db
+Desktop.ini
+.idea/
