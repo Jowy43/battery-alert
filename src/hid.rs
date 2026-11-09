@@ -8,8 +8,10 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetHidGuid, HidD_GetPreparsedData,
-    HidP_GetCaps, HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS,
+    HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid,
+    HidD_GetInputReport, HidD_GetPreparsedData, HidD_GetProductString, HidP_Feature, HidP_GetCaps,
+    HidP_GetUsageValue, HidP_GetValueCaps, HidP_Input, HIDD_ATTRIBUTES, HIDP_CAPS,
+    HIDP_STATUS_SUCCESS, HIDP_VALUE_CAPS,
 };
 use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
@@ -42,10 +44,20 @@ const IO_TIMEOUT_MS: u32 = 180;
 pub struct BatteryReading {
     pub key: String,
     pub name: String,
+    pub kind: DeviceKind,
     pub percent: Option<u8>,
     pub approximate: bool,
     pub voltage_mv: Option<u16>,
     pub status: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceKind {
+    Mouse,
+    Headset,
+    Keyboard,
+    Gamepad,
+    Generic,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +70,7 @@ struct HidInterface {
     usage: u16,
     input_len: usize,
     output_len: usize,
+    product_name: String,
 }
 
 #[derive(Clone, Copy)]
@@ -344,25 +357,15 @@ impl OpenHid {
     }
 }
 
-pub fn read_supported_devices() -> Vec<BatteryReading> {
-    let interfaces = enumerate_logitech_interfaces();
-    let mut mouse = BatteryReading {
-        key: "g502".to_string(),
-        name: "Logitech G502 LIGHTSPEED".to_string(),
-        percent: None,
-        approximate: true,
-        voltage_mv: None,
-        status: "No detectado".to_string(),
-    };
-    let mut headset = BatteryReading {
-        key: "pro-x-wireless".to_string(),
-        name: "Logitech PRO X Wireless".to_string(),
-        percent: None,
-        approximate: true,
-        voltage_mv: None,
-        status: "No detectado".to_string(),
-    };
+pub fn read_battery_devices() -> Vec<BatteryReading> {
+    let mut readings = read_standard_hid_batteries();
+    readings.extend(read_logitech_devices());
+    readings
+}
 
+fn read_logitech_devices() -> Vec<BatteryReading> {
+    let interfaces = enumerate_logitech_interfaces();
+    let mut readings = Vec::new();
     let mut checked_mouse_paths = Vec::new();
     let mut checked_headset_paths = Vec::new();
     for long_info in interfaces.iter().filter(|info| is_long_collection(info)) {
@@ -373,11 +376,32 @@ pub fn read_supported_devices() -> Vec<BatteryReading> {
         }
         if is_headset && !checked_headset_paths.contains(&long_info.path) {
             checked_headset_paths.push(long_info.path.clone());
-            headset.status = "Conectado; consultando batería…".to_string();
+            readings.push(BatteryReading {
+                key: format!("logitech-headset-{:016x}", stable_hash(&long_info.group)),
+                name: "Logitech PRO X Wireless".to_string(),
+                kind: DeviceKind::Headset,
+                percent: None,
+                approximate: true,
+                voltage_mv: None,
+                status: "Conectado; consultando batería…".to_string(),
+            });
         }
         if is_mouse && !checked_mouse_paths.contains(&long_info.path) {
             checked_mouse_paths.push(long_info.path.clone());
-            mouse.status = "Conectado; consultando batería…".to_string();
+            let name = if long_info.product_id == PID_G502_LIGHTSPEED {
+                "Logitech G502 LIGHTSPEED".to_string()
+            } else {
+                "Logitech LIGHTSPEED mouse".to_string()
+            };
+            readings.push(BatteryReading {
+                key: format!("logitech-mouse-{:016x}", stable_hash(&long_info.group)),
+                name,
+                kind: DeviceKind::Mouse,
+                percent: None,
+                approximate: true,
+                voltage_mv: None,
+                status: "Conectado; consultando batería…".to_string(),
+            });
         }
 
         let short_info = interfaces.iter().find(|candidate| {
@@ -390,22 +414,19 @@ pub fn read_supported_devices() -> Vec<BatteryReading> {
                 && candidate.input_len >= 7
         });
         let Some(transport) = HidTransport::open(long_info, short_info) else {
-            if is_headset {
-                headset.status = "No se pudo abrir la interfaz HID".to_string();
-            } else {
-                mouse.status = "No se pudo abrir la interfaz HID".to_string();
+            if let Some(reading) = find_logitech_reading(&mut readings, long_info) {
+                reading.status = "No se pudo abrir la interfaz HID".to_string();
             }
             continue;
         };
 
         if is_headset {
             if let Some(value) = transport.read_battery(DEVICE_INDEX_DIRECT) {
-                headset.percent = Some(value.percent);
-                headset.approximate = value.approximate;
-                headset.voltage_mv = value.voltage_mv;
-                headset.status = "Lectura disponible".to_string();
-            } else {
-                headset.status = "Sin respuesta (puede estar dormido o ocupado)".to_string();
+                if let Some(reading) = find_logitech_reading(&mut readings, long_info) {
+                    apply_value(reading, value, "Lectura disponible".to_string());
+                }
+            } else if let Some(reading) = find_logitech_reading(&mut readings, long_info) {
+                reading.status = "Sin respuesta (puede estar dormido o ocupado)".to_string();
             }
         } else {
             let mut indices = Vec::new();
@@ -424,27 +445,250 @@ pub fn read_supported_devices() -> Vec<BatteryReading> {
             }
             for index in indices {
                 if let Some(value) = transport.read_battery(index) {
-                    mouse.percent = Some(value.percent);
-                    mouse.approximate = value.approximate;
-                    mouse.voltage_mv = value.voltage_mv;
-                    mouse.status = if index == DEVICE_INDEX_DIRECT {
+                    let status = if index == DEVICE_INDEX_DIRECT {
                         "Lectura disponible".to_string()
                     } else {
                         format!("Lectura disponible; receptor, dispositivo {index}")
                     };
+                    if let Some(reading) = find_logitech_reading(&mut readings, long_info) {
+                        apply_value(reading, value, status);
+                    }
                     break;
                 }
             }
-            if mouse.percent.is_none() {
-                mouse.status = "Sin respuesta (puede estar dormido o ocupado)".to_string();
+            if let Some(reading) = find_logitech_reading(&mut readings, long_info) {
+                if reading.percent.is_none() {
+                    reading.status = "Sin respuesta (puede estar dormido o ocupado)".to_string();
+                }
             }
         }
     }
 
-    vec![mouse, headset]
+    readings
+}
+
+fn find_logitech_reading<'a>(
+    readings: &'a mut [BatteryReading],
+    info: &HidInterface,
+) -> Option<&'a mut BatteryReading> {
+    let kind = if info.product_id == PID_PRO_X_WIRELESS {
+        DeviceKind::Headset
+    } else {
+        DeviceKind::Mouse
+    };
+    let key = format!("logitech-{kind:?}-{:016x}", stable_hash(&info.group)).to_ascii_lowercase();
+    readings.iter_mut().find(|reading| reading.key == key)
+}
+
+fn apply_value(reading: &mut BatteryReading, value: BatteryValue, status: String) {
+    reading.percent = Some(value.percent);
+    reading.approximate = value.approximate;
+    reading.voltage_mv = value.voltage_mv;
+    reading.status = status;
+}
+
+fn read_standard_hid_batteries() -> Vec<BatteryReading> {
+    let interfaces = enumerate_hid_interfaces(|vendor_id, product_id| {
+        vendor_id != LOGITECH_VID || !is_supported_pid(product_id)
+    });
+    let mut readings = Vec::new();
+    for info in interfaces {
+        let Some(percent) = read_standard_battery_strength(&info) else {
+            continue;
+        };
+        let key = format!("hid-{:016x}", stable_hash(&info.group));
+        if readings
+            .iter()
+            .any(|reading: &BatteryReading| reading.key == key)
+        {
+            continue;
+        }
+        let name = if info.product_name.trim().is_empty() {
+            format!(
+                "Dispositivo HID {:04X}:{:04X}",
+                info.vendor_id, info.product_id
+            )
+        } else {
+            info.product_name.clone()
+        };
+        readings.push(BatteryReading {
+            key,
+            name,
+            kind: classify_device(&info),
+            percent: Some(percent),
+            approximate: false,
+            voltage_mv: None,
+            status: "Porcentaje comunicado mediante HID estándar".to_string(),
+        });
+    }
+    readings
+}
+
+fn read_standard_battery_strength(info: &HidInterface) -> Option<u8> {
+    let path: Vec<u16> = info.path.encode_utf16().chain(Some(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return None;
+    }
+    let mut preparsed = 0_isize;
+    if !unsafe { HidD_GetPreparsedData(handle, &mut preparsed) } {
+        unsafe { CloseHandle(handle) };
+        return None;
+    }
+    let mut caps = HIDP_CAPS::default();
+    let result = if unsafe { HidP_GetCaps(preparsed, &mut caps) } == HIDP_STATUS_SUCCESS {
+        read_strength_from_reports(handle, preparsed, &caps)
+    } else {
+        None
+    };
+    unsafe {
+        HidD_FreePreparsedData(preparsed);
+        CloseHandle(handle);
+    }
+    result
+}
+
+fn read_strength_from_reports(handle: HANDLE, preparsed: isize, caps: &HIDP_CAPS) -> Option<u8> {
+    for (report_type, value_count, report_len) in [
+        (
+            HidP_Feature,
+            caps.NumberFeatureValueCaps,
+            caps.FeatureReportByteLength,
+        ),
+        (
+            HidP_Input,
+            caps.NumberInputValueCaps,
+            caps.InputReportByteLength,
+        ),
+    ] {
+        if value_count == 0 || report_len == 0 {
+            continue;
+        }
+        let mut value_caps = vec![HIDP_VALUE_CAPS::default(); value_count as usize];
+        let mut actual_count = value_count;
+        if unsafe {
+            HidP_GetValueCaps(
+                report_type,
+                value_caps.as_mut_ptr(),
+                &mut actual_count,
+                preparsed,
+            )
+        } != HIDP_STATUS_SUCCESS
+        {
+            continue;
+        }
+        value_caps.truncate(actual_count as usize);
+        for value_cap in value_caps {
+            if value_cap.UsagePage != 0x06 || !contains_usage(&value_cap, 0x20) {
+                continue;
+            }
+            let mut report = vec![0_u8; report_len as usize];
+            report[0] = value_cap.ReportID;
+            let report_received = unsafe {
+                if report_type == HidP_Feature {
+                    HidD_GetFeature(handle, report.as_mut_ptr().cast(), report.len() as u32)
+                } else {
+                    HidD_GetInputReport(handle, report.as_mut_ptr().cast(), report.len() as u32)
+                }
+            };
+            if !report_received {
+                continue;
+            }
+            let mut value = 0_u32;
+            let parsed = unsafe {
+                HidP_GetUsageValue(
+                    report_type,
+                    0x06,
+                    value_cap.LinkCollection,
+                    0x20,
+                    &mut value,
+                    preparsed,
+                    report.as_ptr(),
+                    report.len() as u32,
+                )
+            };
+            if parsed == HIDP_STATUS_SUCCESS {
+                if let Some(percent) =
+                    normalize_hid_value(value, value_cap.LogicalMin, value_cap.LogicalMax)
+                {
+                    return Some(percent);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn contains_usage(caps: &HIDP_VALUE_CAPS, usage: u16) -> bool {
+    unsafe {
+        if caps.IsRange {
+            caps.Anonymous.Range.UsageMin <= usage && usage <= caps.Anonymous.Range.UsageMax
+        } else {
+            caps.Anonymous.NotRange.Usage == usage
+        }
+    }
+}
+
+fn normalize_hid_value(value: u32, logical_min: i32, logical_max: i32) -> Option<u8> {
+    let range = logical_max.checked_sub(logical_min)?;
+    let value = i64::from(value);
+    if range <= 0 || value > i64::from(logical_max) || value < i64::from(logical_min) {
+        return None;
+    }
+    let normalized = ((value - i64::from(logical_min)) * 100) / i64::from(range);
+    Some(normalized.clamp(0, 100) as u8)
+}
+
+fn classify_device(info: &HidInterface) -> DeviceKind {
+    match (info.usage_page, info.usage) {
+        (0x01, 0x02) => DeviceKind::Mouse,
+        (0x01, 0x04 | 0x05) => DeviceKind::Gamepad,
+        (0x01, 0x06) => DeviceKind::Keyboard,
+        (0x0B, 0x05) => DeviceKind::Headset,
+        _ => {
+            let name = info.product_name.to_ascii_lowercase();
+            if name.contains("headset") || name.contains("headphone") || name.contains("headphones")
+            {
+                DeviceKind::Headset
+            } else if name.contains("mouse") {
+                DeviceKind::Mouse
+            } else if name.contains("keyboard") {
+                DeviceKind::Keyboard
+            } else if name.contains("controller")
+                || name.contains("gamepad")
+                || name.contains("joystick")
+            {
+                DeviceKind::Gamepad
+            } else {
+                DeviceKind::Generic
+            }
+        }
+    }
+}
+
+fn stable_hash(value: &str) -> u64 {
+    value.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ byte.to_ascii_lowercase() as u64).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn enumerate_logitech_interfaces() -> Vec<HidInterface> {
+    enumerate_hid_interfaces(|vendor_id, product_id| {
+        vendor_id == LOGITECH_VID && is_supported_pid(product_id)
+    })
+}
+
+fn enumerate_hid_interfaces(mut supported: impl FnMut(u16, u16) -> bool) -> Vec<HidInterface> {
     let mut hid_guid = unsafe { zeroed() };
     unsafe { HidD_GetHidGuid(&mut hid_guid) };
     let device_info_set: HDEVINFO = unsafe {
@@ -521,7 +765,10 @@ fn enumerate_logitech_interfaces() -> Vec<HidInterface> {
         };
         let vendor_id = parse_hid_id(&path, "vid_");
         let product_id = parse_hid_id(&path, "pid_");
-        if vendor_id != Some(LOGITECH_VID) || !product_id.is_some_and(is_supported_pid) {
+        let (Some(vendor_id), Some(product_id)) = (vendor_id, product_id) else {
+            continue;
+        };
+        if !supported(vendor_id, product_id) {
             continue;
         }
         if let Some(info) = inspect_interface(path) {
@@ -539,7 +786,7 @@ fn inspect_interface(path: String) -> Option<HidInterface> {
     let handle = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             null(),
             OPEN_EXISTING,
@@ -561,6 +808,22 @@ fn inspect_interface(path: String) -> Option<HidInterface> {
     } else {
         0
     };
+    let mut product = [0_u16; 128];
+    let product_name = if unsafe {
+        HidD_GetProductString(
+            handle,
+            product.as_mut_ptr().cast(),
+            (product.len() * size_of::<u16>()) as u32,
+        )
+    } {
+        let end = product
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(product.len());
+        String::from_utf16_lossy(&product[..end]).trim().to_string()
+    } else {
+        String::new()
+    };
     if has_preparsed {
         unsafe { HidD_FreePreparsedData(preparsed) };
     }
@@ -571,9 +834,6 @@ fn inspect_interface(path: String) -> Option<HidInterface> {
     }
     let vendor_id = attributes.VendorID;
     let product_id = attributes.ProductID;
-    if vendor_id != LOGITECH_VID || !is_supported_pid(product_id) {
-        return None;
-    }
     Some(HidInterface {
         group: collection_group(&path),
         path,
@@ -583,6 +843,7 @@ fn inspect_interface(path: String) -> Option<HidInterface> {
         usage: caps.Usage,
         input_len: caps.InputReportByteLength as usize,
         output_len: caps.OutputReportByteLength as usize,
+        product_name,
     })
 }
 

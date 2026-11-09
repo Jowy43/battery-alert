@@ -2,7 +2,7 @@
 name = "battery-alert"
 version = "0.1.0"
 edition = "2021"
-description = "Monitor de batería para periféricos Logitech en Windows"
+description = "Monitor genérico de baterías HID para periféricos en Windows"
 
 [dependencies]
 windows-sys = { version = "0.61.2", features = [

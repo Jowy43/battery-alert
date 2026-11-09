@@ -27,15 +27,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu, TranslateMessage,
     DI_NORMAL, GW_OWNER, IDI_APPLICATION, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
     SM_CXSCREEN, SM_CYSCREEN, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE,
-    WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONUP, WM_NULL, WM_PAINT, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP,
+    WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEWHEEL, WM_NULL, WM_PAINT,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPED, WS_POPUP,
 };
 
-use crate::hid::{self, BatteryReading};
+use crate::hid::{self, BatteryReading, DeviceKind};
 
-const TRAY_ID_MOUSE: u32 = 1;
-const TRAY_ID_HEADSET: u32 = 2;
-const ICON_LEVEL_COUNT: usize = 11;
+const TRAY_ID_PLACEHOLDER: u32 = 1;
+const FIRST_DEVICE_TRAY_ID: u32 = 2;
 const PANEL_WIDTH: i32 = 384;
 const PANEL_HEIGHT: i32 = 320;
 const PANEL_CLASS_NAME: &str = "BatteryAlert.BatteryPanel";
@@ -55,126 +54,151 @@ static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
 struct AppState {
     readings: Vec<BatteryReading>,
     low_notified: HashMap<String, bool>,
-    mouse_icons: Vec<isize>,
-    headset_icons: Vec<isize>,
-    mouse_unknown_icon: isize,
-    headset_unknown_icon: isize,
+    tray_devices: HashMap<String, TrayDevice>,
+    next_tray_id: u32,
+    placeholder_icon: isize,
+    placeholder_active: bool,
     panel_hwnd: isize,
+    panel_scroll: usize,
+}
+
+struct TrayDevice {
+    tray_id: u32,
+    icon: isize,
 }
 
 impl AppState {
     fn new() -> Self {
         Self {
-            readings: vec![
-                BatteryReading {
-                    key: "g502".to_string(),
-                    name: "Logitech G502 LIGHTSPEED".to_string(),
-                    percent: None,
-                    approximate: true,
-                    voltage_mv: None,
-                    status: "Buscando dispositivo".to_string(),
-                },
-                BatteryReading {
-                    key: "pro-x-wireless".to_string(),
-                    name: "Logitech PRO X Wireless".to_string(),
-                    percent: None,
-                    approximate: true,
-                    voltage_mv: None,
-                    status: "Buscando dispositivo".to_string(),
-                },
-            ],
+            readings: Vec::new(),
             low_notified: HashMap::new(),
-            mouse_icons: (0..ICON_LEVEL_COUNT)
-                .map(|step| {
-                    create_device_icon(DeviceIconKind::Mouse, Some((step * 10) as u8)) as isize
-                })
-                .collect(),
-            headset_icons: (0..ICON_LEVEL_COUNT)
-                .map(|step| {
-                    create_device_icon(DeviceIconKind::Headset, Some((step * 10) as u8)) as isize
-                })
-                .collect(),
-            mouse_unknown_icon: create_device_icon(DeviceIconKind::Mouse, None) as isize,
-            headset_unknown_icon: create_device_icon(DeviceIconKind::Headset, None) as isize,
+            tray_devices: HashMap::new(),
+            next_tray_id: FIRST_DEVICE_TRAY_ID,
+            placeholder_icon: create_device_icon(DeviceKind::Generic, None) as isize,
+            placeholder_active: false,
             panel_hwnd: 0,
+            panel_scroll: 0,
         }
     }
 
     fn refresh(&mut self, hwnd: HWND) {
-        self.readings = hid::read_supported_devices();
+        self.readings = hid::read_battery_devices();
+        self.update_tray(hwnd);
         for reading in &self.readings {
             if let Some(percent) = reading.percent {
                 let already_notified = self.low_notified.entry(reading.key.clone()).or_default();
                 if percent <= LOW_BATTERY_THRESHOLD && !*already_notified {
                     *already_notified = true;
-                    show_low_battery_notification(hwnd, reading);
+                    let tray_id = self
+                        .tray_devices
+                        .get(&reading.key)
+                        .map(|device| device.tray_id)
+                        .unwrap_or(TRAY_ID_PLACEHOLDER);
+                    show_low_battery_notification(hwnd, tray_id, reading);
                 } else if percent >= RESET_NOTIFICATION_THRESHOLD {
                     *already_notified = false;
                 }
             }
         }
-        self.update_tray(hwnd);
         if self.panel_hwnd != 0 {
             unsafe { InvalidateRect(self.panel_hwnd as _, null(), 0) };
         }
     }
 
     fn update_tray(&mut self, hwnd: HWND) {
-        for (key, tray_id) in [("g502", TRAY_ID_MOUSE), ("pro-x-wireless", TRAY_ID_HEADSET)] {
-            let mut data = notify_data(hwnd, tray_id, self.icon(key));
-            data.uFlags = NIF_ICON | NIF_TIP;
-            copy_wide(&mut data.szTip, &self.tooltip(key));
-            unsafe {
-                Shell_NotifyIconW(NIM_MODIFY, &data);
+        let active_keys: std::collections::HashSet<String> = self
+            .readings
+            .iter()
+            .map(|reading| reading.key.clone())
+            .collect();
+        let removed_keys: Vec<String> = self
+            .tray_devices
+            .keys()
+            .filter(|key| !active_keys.contains(*key))
+            .cloned()
+            .collect();
+        for key in removed_keys {
+            if let Some(device) = self.tray_devices.remove(&key) {
+                let data = notify_data(hwnd, device.tray_id, null_mut());
+                unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+                if device.icon != 0 {
+                    unsafe { DestroyIcon(device.icon as _) };
+                }
+            }
+        }
+
+        if self.readings.is_empty() {
+            if !self.placeholder_active {
+                if self.placeholder_icon == 0 {
+                    self.placeholder_icon = create_device_icon(DeviceKind::Generic, None) as isize;
+                }
+                self.placeholder_active = add_tray_icon(
+                    hwnd,
+                    TRAY_ID_PLACEHOLDER,
+                    self.placeholder_icon as _,
+                    "Battery Alert | No se detectaron baterías HID",
+                );
+            }
+            return;
+        }
+
+        for index in 0..self.readings.len() {
+            let reading = &self.readings[index];
+            let key = reading.key.clone();
+            if self.placeholder_active && self.placeholder_icon == 0 {
+                self.placeholder_icon = create_device_icon(DeviceKind::Generic, None) as isize;
+            }
+            let (tray_id, old_icon, is_new) = if let Some(device) = self.tray_devices.get(&key) {
+                (device.tray_id, device.icon, false)
+            } else if self.placeholder_active {
+                (TRAY_ID_PLACEHOLDER, self.placeholder_icon, false)
+            } else {
+                let tray_id = self.next_tray_id;
+                self.next_tray_id = self.next_tray_id.wrapping_add(1).max(FIRST_DEVICE_TRAY_ID);
+                (tray_id, 0, true)
+            };
+            let icon = create_device_icon(reading.kind, reading.percent) as isize;
+            let mut data = notify_data(hwnd, tray_id, icon as _);
+            data.uFlags = NIF_ICON | NIF_TIP | if is_new { NIF_MESSAGE } else { 0 };
+            if is_new {
+                data.uCallbackMessage = CALLBACK_MESSAGE;
+            }
+            copy_wide(&mut data.szTip, &Self::tooltip(reading));
+            let operation = if is_new { NIM_ADD } else { NIM_MODIFY };
+            let succeeded = unsafe { Shell_NotifyIconW(operation, &data) != 0 };
+            if succeeded {
+                if old_icon != 0 {
+                    unsafe { DestroyIcon(old_icon as _) };
+                }
+                self.tray_devices.insert(key, TrayDevice { tray_id, icon });
+                if tray_id == TRAY_ID_PLACEHOLDER {
+                    self.placeholder_active = false;
+                    self.placeholder_icon = 0;
+                }
+            } else if icon != 0 {
+                unsafe { DestroyIcon(icon as _) };
             }
         }
     }
 
-    fn icon(&self, key: &str) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
-        let percent = self
-            .readings
-            .iter()
-            .find(|reading| reading.key == key)
-            .and_then(|reading| reading.percent);
-        let (icons, unknown_icon) = if key == "g502" {
-            (&self.mouse_icons, self.mouse_unknown_icon)
-        } else {
-            (&self.headset_icons, self.headset_unknown_icon)
-        };
-        percent
-            .map(|value| (value as usize / 10).min(ICON_LEVEL_COUNT - 1))
-            .and_then(|index| icons.get(index).copied())
-            .or(Some(unknown_icon))
-            .filter(|handle| *handle != 0)
-            .map(|handle| handle as _)
-            .unwrap_or_else(|| unsafe { LoadIconW(null_mut(), IDI_APPLICATION) })
-    }
-
-    fn tooltip(&self, key: &str) -> String {
-        let reading = self.readings.iter().find(|reading| reading.key == key);
-        let short_name = if key == "g502" { "Ratón" } else { "Cascos" };
-        match reading {
-            Some(reading) => match reading.percent {
-                Some(percent) => {
-                    let estimate = if reading.approximate { "~" } else { "" };
-                    format!("Battery Alert | {short_name} {estimate}{percent}%")
-                }
-                None => format!("Battery Alert | {short_name}: {}", reading.status),
-            },
-            None => format!("Battery Alert | {short_name}: Sin lectura"),
+    fn tooltip(reading: &BatteryReading) -> String {
+        match reading.percent {
+            Some(percent) => {
+                let estimate = if reading.approximate { "~" } else { "" };
+                format!("{} | {estimate}{percent}%", reading.name)
+            }
+            None => format!("{} | {}", reading.name, reading.status),
         }
     }
 
     fn shutdown(&mut self) {
-        for icon in self
-            .mouse_icons
-            .drain(..)
-            .chain(self.headset_icons.drain(..))
-            .chain([self.mouse_unknown_icon, self.headset_unknown_icon])
-        {
-            if icon != 0 {
-                unsafe { DestroyIcon(icon as _) };
+        for (_, device) in self.tray_devices.drain() {
+            if device.icon != 0 {
+                unsafe { DestroyIcon(device.icon as _) };
             }
+        }
+        if self.placeholder_icon != 0 {
+            unsafe { DestroyIcon(self.placeholder_icon as _) };
         }
     }
 }
@@ -315,12 +339,20 @@ unsafe extern "system" fn window_proc(
             if !panel.is_null() {
                 unsafe { DestroyWindow(panel) };
             }
+            if let Some(state) = APP.get() {
+                if let Ok(state) = state.lock() {
+                    for device in state.tray_devices.values() {
+                        let data = notify_data(hwnd, device.tray_id, null_mut());
+                        unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+                    }
+                    if state.placeholder_active {
+                        let data = notify_data(hwnd, TRAY_ID_PLACEHOLDER, null_mut());
+                        unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+                    }
+                }
+            }
             unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, TIMER_ID);
-                for tray_id in [TRAY_ID_MOUSE, TRAY_ID_HEADSET] {
-                    let data = notify_data(hwnd, tray_id, null_mut());
-                    Shell_NotifyIconW(NIM_DELETE, &data);
-                }
                 PostQuitMessage(0);
             }
             0
@@ -408,6 +440,21 @@ unsafe extern "system" fn panel_window_proc(
             handle_panel_click(hwnd, lparam);
             0
         }
+        WM_MOUSEWHEEL => {
+            if let Some(state) = APP.get() {
+                if let Ok(mut state) = state.lock() {
+                    let delta = ((wparam >> 16) as u16) as i16;
+                    let max_scroll = state.readings.len().saturating_sub(2);
+                    if delta < 0 {
+                        state.panel_scroll = (state.panel_scroll + 1).min(max_scroll);
+                    } else if delta > 0 {
+                        state.panel_scroll = state.panel_scroll.saturating_sub(1);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+            0
+        }
         WM_KILLFOCUS => {
             DestroyWindow(hwnd);
             0
@@ -486,7 +533,19 @@ fn draw_battery_panel(hwnd: HWND) {
     );
     draw_panel_text(
         hdc,
-        "BATERÍA DE TUS DISPOSITIVOS",
+        &APP.get()
+            .and_then(|state| {
+                state.lock().ok().map(|state| {
+                    if state.readings.len() > 2 {
+                        format!("{} DISPOSITIVOS · RUEDA PARA VER MÁS", state.readings.len())
+                    } else if state.readings.is_empty() {
+                        "ESPERANDO DISPOSITIVOS CON BATERÍA".to_string()
+                    } else {
+                        "BATERÍA DE TUS DISPOSITIVOS".to_string()
+                    }
+                })
+            })
+            .unwrap_or_else(|| "BATERÍA DE TUS DISPOSITIVOS".to_string()),
         RECT {
             left: 21,
             top: 38,
@@ -514,24 +573,57 @@ fn draw_battery_panel(hwnd: HWND) {
         DT_SINGLELINE | DT_VCENTER,
     );
 
-    let devices = APP.get().and_then(|state| {
+    let cards = APP.get().and_then(|state| {
         state.lock().ok().map(|state| {
-            (
-                state.readings.clone(),
-                state.icon("g502"),
-                state.icon("pro-x-wireless"),
-            )
+            state
+                .readings
+                .iter()
+                .skip(state.panel_scroll)
+                .take(2)
+                .map(|reading| {
+                    let icon = state
+                        .tray_devices
+                        .get(&reading.key)
+                        .map(|device| device.icon as _)
+                        .unwrap_or_else(|| unsafe { LoadIconW(null_mut(), IDI_APPLICATION) });
+                    (reading.clone(), icon)
+                })
+                .collect::<Vec<_>>()
         })
     });
-    if let Some((readings, mouse_icon, headset_icon)) = devices {
-        if let Some(mouse) = readings.iter().find(|reading| reading.key == "g502") {
-            draw_panel_card(hdc, 14, 62, mouse, mouse_icon);
+    if let Some(cards) = cards {
+        if cards.is_empty() {
+            draw_panel_text(
+                hdc,
+                "No hay dispositivos que publiquen batería por HID estándar.",
+                RECT {
+                    left: 24,
+                    top: 88,
+                    right: 360,
+                    bottom: 132,
+                },
+                rgb(170, 179, 188),
+                12,
+                FW_NORMAL,
+                DT_LEFT,
+            );
+            draw_panel_text(
+                hdc,
+                "Conecta un dispositivo compatible y pulsa Actualizar ahora.",
+                RECT {
+                    left: 24,
+                    top: 128,
+                    right: 360,
+                    bottom: 168,
+                },
+                rgb(130, 141, 152),
+                10,
+                FW_NORMAL,
+                DT_LEFT,
+            );
         }
-        if let Some(headset) = readings
-            .iter()
-            .find(|reading| reading.key == "pro-x-wireless")
-        {
-            draw_panel_card(hdc, 14, 151, headset, headset_icon);
+        for (index, (reading, icon)) in cards.iter().enumerate() {
+            draw_panel_card(hdc, 14, 62 + index as i32 * 89, reading, *icon);
         }
     }
 
@@ -618,14 +710,9 @@ fn draw_panel_card(
         );
     }
 
-    let device_name = if reading.key == "g502" {
-        "G502 LIGHTSPEED"
-    } else {
-        "PRO X Wireless"
-    };
     draw_panel_text(
         hdc,
-        device_name,
+        &reading.name,
         RECT {
             left: top + 68,
             top: card_top + 12,
@@ -808,30 +895,22 @@ fn fill_rounded_rect(
 }
 
 fn add_tray_icons(hwnd: HWND) -> bool {
-    let Some((mouse_icon, mouse_tip, headset_icon, headset_tip)) = APP.get().and_then(|state| {
-        state.lock().ok().map(|state| {
-            (
-                state.icon("g502"),
-                state.tooltip("g502"),
-                state.icon("pro-x-wireless"),
-                state.tooltip("pro-x-wireless"),
-            )
+    let Some(added) = APP.get().and_then(|state| {
+        state.lock().ok().map(|mut state| {
+            let icon = state.placeholder_icon as _;
+            let added = add_tray_icon(
+                hwnd,
+                TRAY_ID_PLACEHOLDER,
+                icon,
+                "Battery Alert | Buscando dispositivos con batería",
+            );
+            state.placeholder_active = added;
+            added
         })
     }) else {
         return false;
     };
-
-    let mouse_added = add_tray_icon(hwnd, TRAY_ID_MOUSE, mouse_icon, &mouse_tip);
-    let headset_added =
-        mouse_added && add_tray_icon(hwnd, TRAY_ID_HEADSET, headset_icon, &headset_tip);
-    if !mouse_added || !headset_added {
-        for tray_id in [TRAY_ID_MOUSE, TRAY_ID_HEADSET] {
-            let data = notify_data(hwnd, tray_id, null_mut());
-            unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
-        }
-        return false;
-    }
-    true
+    added
 }
 
 fn add_tray_icon(
@@ -957,7 +1036,7 @@ fn notify_data(
     data
 }
 
-fn show_low_battery_notification(hwnd: HWND, reading: &BatteryReading) {
+fn show_low_battery_notification(hwnd: HWND, tray_id: u32, reading: &BatteryReading) {
     let percent = reading.percent.unwrap_or_default();
     let estimate = if reading.approximate {
         "aproximada "
@@ -965,11 +1044,6 @@ fn show_low_battery_notification(hwnd: HWND, reading: &BatteryReading) {
         ""
     };
     let message = format!("{} tiene {estimate}{percent}% de batería.", reading.name);
-    let tray_id = if reading.key == "g502" {
-        TRAY_ID_MOUSE
-    } else {
-        TRAY_ID_HEADSET
-    };
     let mut data = notify_data(hwnd, tray_id, null_mut());
     data.uFlags = NIF_INFO;
     data.dwInfoFlags = NIIF_WARNING;
@@ -1092,14 +1166,8 @@ fn remove_startup_entry() {
     }
 }
 
-#[derive(Clone, Copy)]
-enum DeviceIconKind {
-    Mouse,
-    Headset,
-}
-
 fn create_device_icon(
-    kind: DeviceIconKind,
+    kind: DeviceKind,
     percent: Option<u8>,
 ) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
     const WIDTH: usize = 32;
@@ -1117,8 +1185,11 @@ fn create_device_icon(
     icon_data[HEADER_SIZE + COLOR_SIZE..].fill(0xFF);
 
     match kind {
-        DeviceIconKind::Mouse => draw_mouse(&mut icon_data),
-        DeviceIconKind::Headset => draw_headset(&mut icon_data),
+        DeviceKind::Mouse => draw_mouse(&mut icon_data),
+        DeviceKind::Headset => draw_headset(&mut icon_data),
+        DeviceKind::Keyboard => draw_keyboard(&mut icon_data),
+        DeviceKind::Gamepad => draw_gamepad(&mut icon_data),
+        DeviceKind::Generic => draw_generic(&mut icon_data),
     }
     draw_battery_strip(&mut icon_data, percent);
 
@@ -1133,6 +1204,47 @@ fn create_device_icon(
             0,
         )
     }
+}
+
+fn draw_keyboard(icon_data: &mut [u8]) {
+    let outline = [28, 31, 35, 255];
+    let body = [224, 230, 235, 255];
+    let key = [92, 103, 113, 255];
+    fill_icon_rect(icon_data, 3, 7, 29, 24, outline);
+    fill_icon_rect(icon_data, 5, 9, 27, 22, body);
+    for row in 0..2 {
+        for column in 0..6 {
+            let left = 7 + column * 3;
+            let top = 11 + row * 4;
+            fill_icon_rect(icon_data, left, top, left + 2, top + 2, key);
+        }
+    }
+    fill_icon_rect(icon_data, 11, 19, 21, 21, key);
+}
+
+fn draw_gamepad(icon_data: &mut [u8]) {
+    let outline = [28, 31, 35, 255];
+    let body = [224, 230, 235, 255];
+    let detail = [75, 177, 225, 255];
+    fill_icon_rect(icon_data, 7, 9, 25, 23, outline);
+    fill_icon_rect(icon_data, 4, 13, 10, 25, outline);
+    fill_icon_rect(icon_data, 22, 13, 28, 25, outline);
+    fill_icon_rect(icon_data, 8, 11, 24, 21, body);
+    fill_icon_rect(icon_data, 6, 16, 9, 18, detail);
+    fill_icon_rect(icon_data, 6, 14, 8, 20, detail);
+    fill_icon_rect(icon_data, 23, 14, 25, 16, detail);
+    fill_icon_rect(icon_data, 25, 17, 27, 19, detail);
+}
+
+fn draw_generic(icon_data: &mut [u8]) {
+    let outline = [28, 31, 35, 255];
+    let body = [224, 230, 235, 255];
+    let accent = [75, 177, 225, 255];
+    fill_icon_rect(icon_data, 7, 4, 25, 25, outline);
+    fill_icon_rect(icon_data, 9, 6, 23, 23, body);
+    fill_icon_rect(icon_data, 14, 9, 18, 12, accent);
+    fill_icon_rect(icon_data, 12, 15, 20, 17, accent);
+    fill_icon_rect(icon_data, 12, 19, 20, 21, accent);
 }
 
 fn draw_mouse(icon_data: &mut [u8]) {

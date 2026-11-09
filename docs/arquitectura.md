@@ -6,23 +6,23 @@ Battery Alert es una aplicación nativa de bandeja para Windows. Está escrita e
 
 - `src/main.rs`: punto de entrada y manejo del error de inicio.
 - `src/tray.rs`: ventana oculta, icono de notificación, menú, temporizador, avisos de batería baja y opción de inicio con Windows.
-- `src/hid.rs`: enumeración de dispositivos HID, comunicación con los informes de Logitech y conversión de lecturas a porcentajes.
+- `src/hid.rs`: enumeración HID, lectura del uso estándar `Battery Strength`, adaptador Logitech HID++ y conversión de lecturas a porcentajes.
 - `Cargo.toml` y `Cargo.lock`: dependencias y configuración de compilación.
 - `.github/workflows/release.yml`: compilación de Windows y publicación de artefactos al enviar una etiqueta de versión.
 
 ## Ciclo de lectura
 
 1. Windows enumera las interfaces HID presentes mediante SetupAPI.
-2. Battery Alert filtra las interfaces del fabricante Logitech y los identificadores contemplados en `src/hid.rs`.
-3. La aplicación abre la interfaz y consulta informes de batería del protocolo HID Logitech. Para los receptores de ratón intenta localizar el dispositivo conectado.
-4. Se prefiere un porcentaje informado por el periférico. Si las respuestas disponibles contienen voltaje, se aplica una curva aproximada y la interfaz antepone `~`.
-5. La bandeja mantiene un icono por dispositivo: la silueta de un ratón y la de unos cascos, cada una con una franja coloreada según su propio nivel. Si no hay lectura disponible, la franja queda marcada como no disponible. El clic izquierdo abre un panel con los dos dispositivos, porcentajes, barras de nivel y controles; el clic derecho abre el menú tradicional.
+2. Para periféricos que declaran el uso HID estándar `Battery Strength` (usage page `0x06`, usage `0x20`), la aplicación consulta los informes de entrada y de características y normaliza el valor con los límites lógicos del descriptor.
+3. Las interfaces Logitech de los modelos e identificadores admitidos se consultan además mediante el protocolo HID++ específico. Para receptores LIGHTSPEED de ratón intenta localizar los dispositivos conectados.
+4. Se prefiere el porcentaje comunicado por el periférico. Si Logitech solo responde con voltaje, se aplica una curva aproximada y la interfaz antepone `~`.
+5. La bandeja crea un icono independiente por cada dispositivo leído. La silueta se clasifica con la colección HID o el nombre declarado; hay iconos para ratón, cascos, teclado, mando y dispositivo genérico. El clic izquierdo abre un panel dinámico con dos tarjetas visibles y desplazamiento con la rueda si hay más dispositivos.
 
 La consulta se inicia al arrancar y se repite cada 60 segundos. El comando **Actualizar ahora** ejecuta el mismo ciclo antes del siguiente intervalo.
 
 ## Interfaz y avisos
 
-El proceso crea una ventana Win32 oculta para recibir eventos de los iconos y del temporizador. Cada icono tiene niveles gráficos en tramos de diez puntos y la descripción emergente muestra el porcentaje de ese dispositivo. El panel se dibuja con GDI, se ancla junto al cursor y ofrece actualización manual y el control de inicio con Windows. El menú de clic derecho muestra ambos porcentajes y el voltaje leído cuando el porcentaje es estimado. Las estimaciones se marcan con `~`.
+El proceso crea una ventana Win32 oculta para recibir eventos de los iconos y del temporizador. Cada icono tiene una franja coloreada según la lectura y la descripción emergente muestra el nombre y porcentaje de ese dispositivo. El panel se dibuja con GDI, se ancla junto al cursor y ofrece actualización manual y el control de inicio con Windows. El menú de clic derecho muestra los porcentajes leídos y el voltaje cuando Logitech solo informa voltaje. Las estimaciones se marcan con `~`.
 
 El aviso de batería baja se dispara al detectar un valor de 20 % o menos. Para evitar avisos repetidos, ese dispositivo vuelve a quedar habilitado para notificar cuando la lectura llega al 26 % o más. Este estado solo vive mientras la aplicación está abierta.
 
@@ -36,7 +36,8 @@ La comunicación HID se hace desde el ciclo de refresco de la bandeja. El tiempo
 
 ## Límites actuales
 
-- La búsqueda de dispositivos y los protocolos de batería están orientados a los modelos e identificadores Logitech descritos en el README; no es un monitor genérico de cualquier periférico Bluetooth o USB.
+- La capa genérica solo puede leer periféricos HID que publiquen el uso estándar `Battery Strength`. Los fabricantes que usen protocolos privados requieren un adaptador; Logitech HID++ está implementado para los modelos e identificadores indicados en el README.
+- El nombre y el tipo dependen de la información que publique el descriptor HID. Algunos periféricos pueden aparecer con un nombre genérico o una silueta aproximada.
 - El porcentaje derivado de voltaje es una estimación, no una lectura calibrada por Logitech.
 - No se muestra el estado de carga ni un historial de batería.
 - La lectura real depende de que firmware, receptor y estado de energía respondan a los informes HID.

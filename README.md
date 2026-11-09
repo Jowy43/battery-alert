@@ -1,35 +1,33 @@
 # Battery Alert
 
-Aplicación ligera para Windows que consulta la batería de algunos periféricos Logitech y muestra el nivel en el área de notificación, junto al reloj.
+Aplicación ligera para Windows que detecta periféricos HID que publican su nivel de batería y lo muestra en la bandeja del sistema. Cada dispositivo tiene su propio icono, con una figura según su tipo y una franja de batería.
+
+## Compatibilidad
+
+Battery Alert combina dos métodos de lectura:
+
+- **HID estándar:** busca el uso `Battery Strength` definido en HID Usage Page `0x06` y lee los informes de entrada o de características que ofrece el periférico. El valor se convierte a porcentaje usando el rango lógico declarado por el dispositivo.
+- **Logitech HID++:** mantiene un adaptador específico para Logitech G502 LIGHTSPEED, PRO X Wireless y los identificadores de receptores LIGHTSPEED contemplados por el lector. Cuando Logitech solo comunica voltaje, el porcentaje se estima y se marca con `~`.
+
+La detección es dinámica: no hay una lista fija de dos tarjetas. Los dispositivos estándar compatibles se muestran con el nombre que declara su interfaz HID y se clasifican como ratón, cascos, teclado, mando o dispositivo genérico.
+
+**No existe una lectura universal para todos los periféricos.** Muchos fabricantes no publican `Battery Strength` y usan protocolos privados. Esos modelos requieren un adaptador compatible; si Windows o el dispositivo no exponen una lectura admitida, Battery Alert no puede inventar el porcentaje y no lo mostrará como una batería válida. Un dispositivo dormido, desconectado o con la interfaz ocupada puede dejar de responder hasta la siguiente actualización.
 
 ## Funciones
 
-- Consulta el **Logitech G502 LIGHTSPEED** y los **Logitech PRO X Wireless**.
-- Actualiza las lecturas cada minuto; el menú permite pedir una actualización inmediata.
-- Muestra un icono independiente para el ratón y otro para los cascos, cada uno con su propio indicador de batería. El porcentaje numérico aparece al pasar el puntero sobre cada icono.
-- Al hacer clic izquierdo en cualquiera de los iconos, abre un panel visual con ambos dispositivos, sus porcentajes, barras de batería y controles. El clic derecho conserva el menú de la aplicación.
+- Actualiza los niveles cada minuto y permite solicitar una actualización inmediata.
+- Muestra un icono independiente por dispositivo, con su tipo y batería. El porcentaje aparece al pasar el puntero sobre el icono.
+- Al hacer clic en cualquier icono, abre un panel con las lecturas disponibles. Si hay más de dos dispositivos, se puede recorrer la lista con la rueda del ratón.
 - Avisa con una notificación de Windows al llegar al 20 % o menos. No repite el aviso hasta que la batería sube al 26 %.
-- Puede iniciarse con Windows, opción que se activa desde el menú del icono.
-- No necesita Logitech G HUB abierto.
+- Puede iniciarse con Windows; la opción está en el menú del icono.
+- No necesita Logitech G HUB abierto para consultar el adaptador Logitech.
+- No envía datos ni consulta un servicio en Internet.
 
-## Compatibilidad y precisión
-
-El lector busca interfaces HID Logitech con estos identificadores de producto:
-
-| Dispositivo | Identificador |
-| --- | --- |
-| G502 LIGHTSPEED | `046D:C08D` |
-| PRO X Wireless | `046D:0ABA` |
-
-También contempla varios identificadores de receptores LIGHTSPEED para ratones. Que un identificador esté contemplado no garantiza una lectura con todos los firmwares, receptores o configuraciones. La lectura de estos dos periféricos debe confirmarse en el equipo donde se ejecute la aplicación.
-
-Cuando el dispositivo proporciona un porcentaje, se muestra directamente. Si solo responde con voltaje, Battery Alert calcula una estimación y añade `~` al porcentaje. El G502 LIGHTSPEED comunica el voltaje, así que su porcentaje es aproximado y puede diferir de G HUB. El menú muestra también el voltaje leído para facilitar la comparación. Un dispositivo dormido, desconectado o con su interfaz HID ocupada puede aparecer sin lectura; en ese caso no se conserva como actual un valor anterior.
+Windows puede colocar algunos iconos en el menú de iconos ocultos. Se puede elegir qué iconos aparecen siempre desde la configuración de la bandeja del sistema.
 
 ## Descargar y ejecutar
 
-La página **Releases** publicará un ZIP con el ejecutable y su suma SHA-256 cuando se publique una etiqueta de versión `v*` en GitHub. Extrae el ZIP y ejecuta `battery-alert.exe`. Es una aplicación portable: no incluye instalador ni desinstalador.
-
-Los iconos pueden quedar en el menú de iconos ocultos de Windows. Cada uno representa el tramo de batería de su dispositivo; al dejar el puntero sobre el ratón o los cascos se ve su porcentaje correspondiente. El panel se cierra al hacer clic fuera o en el botón de cierre.
+La página **Releases** publica un ZIP con el ejecutable y su suma SHA-256 al crear una etiqueta `v*` en GitHub. Extrae el ZIP y ejecuta `battery-alert.exe`. Es una aplicación portable: no incluye instalador ni desinstalador.
 
 ## Requisitos
 
